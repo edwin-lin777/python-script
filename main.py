@@ -51,6 +51,41 @@ def _num(v):
     return f
 
 
+def fetch_fundamentals(tickers):
+    """Per-ticker valuation stats from yfinance .info.
+    Missing values stay None so Claude can say 'unavailable' instead of
+    guessing a multiple from memory (the whole reason this exists)."""
+    out = {}
+    for t in tickers:
+        rec = {
+            "fwd_pe": None, "pe": None, "peg": None, "ps": None,
+            "fcf_yield_%": None, "sector": None, "pct_from_52w_high_%": None,
+        }
+        try:
+            info = yf.Ticker(t).info
+            rec["fwd_pe"] = _num(info.get("forwardPE"))
+            rec["pe"]     = _num(info.get("trailingPE"))
+            rec["peg"]    = _num(info.get("trailingPegRatio"))
+            rec["ps"]     = _num(info.get("priceToSalesTrailing12Months"))
+            rec["sector"] = info.get("sector")
+
+            fcf  = info.get("freeCashflow")
+            mcap = info.get("marketCap")
+            if fcf is not None and mcap:
+                rec["fcf_yield_%"] = _num(fcf / mcap * 100)
+
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            hi = info.get("fiftyTwoWeekHigh")
+            if price and hi:
+                rec["pct_from_52w_high_%"] = _num((price / hi - 1) * 100)
+        except Exception:
+            pass
+        finally:
+            time.sleep(0.1)   # be gentle with Yahoo, same as the screener
+        out[t] = rec
+    return out
+
+
 # ========================= RISK (unchanged) =========================
 def fetch_prices(tickers, period):
     px = yf.download(tickers, period=period, auto_adjust=True)["Close"]
@@ -161,11 +196,18 @@ def compute_risk(req: RiskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
+    # Live valuation stats so the downstream Claude review doesn't guess multiples.
+    try:
+        fundamentals = fetch_fundamentals(tickers)
+    except Exception:
+        fundamentals = {}
+
     positions_out = []
     for ticker, row in per_pos.iterrows():
         rec = {"ticker": ticker}
         for col, val in row.items():
             rec[col] = _num(val)
+        rec.update(fundamentals.get(ticker, {}))
         positions_out.append(rec)
 
     portfolio_out = {k: _num(v) for k, v in portfolio.items()}
