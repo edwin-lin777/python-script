@@ -32,6 +32,11 @@ class ScreenRequest(BaseModel):
     fcf_yield_min: float = 3.0        # generous bar so quality-growth (VEEV-type) passes (%)
     use_all_time_high: bool = True    # False -> use 52-week high
     max_tickers: int | None = None    # cap the universe for quick testing
+    # "quiet base" gate: little price movement over the last ~month (consolidation)
+    require_quiet: bool = False       # off by default; turn on to hunt non-movers
+    quiet_lookback_days: int = 21     # ~1 trading month
+    max_range_pct: float = 12.0       # last-month high-to-low range must be <= this (%)
+    max_drift_pct: float = 6.0        # net change over the window must be within +/- this (%)
 
 
 @app.get("/health")
@@ -256,10 +261,44 @@ def run_screen(tickers, p):
             if drawdown > p.drawdown_min:
                 continue
 
+            # gate 3 (optional): "quiet base" — little movement over ~1 month.
+            # range_pct = last-month high-to-low spread; drift_pct = net change.
+            # A true consolidation is BOTH a tight range AND a flat drift.
+            range_pct = None
+            drift_pct = None
+            try:
+                if p.use_all_time_high:
+                    recent = hist.dropna()                       # reuse the series we already have
+                else:
+                    recent = tk.history(period="3mo")["Close"].dropna()
+                window = recent.tail(p.quiet_lookback_days)
+                if len(window) >= 5:
+                    w_hi = float(window.max())
+                    w_lo = float(window.min())
+                    w_mean = float(window.mean())
+                    w_first = float(window.iloc[0])
+                    w_last = float(window.iloc[-1])
+                    if w_mean > 0:
+                        range_pct = (w_hi - w_lo) / w_mean * 100
+                    if w_first > 0:
+                        drift_pct = (w_last / w_first - 1) * 100
+            except Exception:
+                pass
+
+            if p.require_quiet:
+                if range_pct is None or drift_pct is None:
+                    continue
+                if range_pct > p.max_range_pct:            # too wide a range -> still swinging
+                    continue
+                if abs(drift_pct) > p.max_drift_pct:       # trending, not flat
+                    continue
+
             records.append({
                 "ticker": t, "sector": info.get("sector"),
                 "price": price, "high": high,
                 "drawdown_%": drawdown, "fcf_yield_%": fcf_yield,
+                "range_1m_%": range_pct,                   # last-month high-to-low spread
+                "drift_1m_%": drift_pct,                   # last-month net change
                 "pe": info.get("trailingPE"),        # eyeball only
                 "fwd_pe": info.get("forwardPE"),     # eyeball only
             })
