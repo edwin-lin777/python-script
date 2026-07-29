@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import io
 import time
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ class Position(BaseModel):
     ticker: str
     shares: float
     cost_basis: float | None = None
+    stop_loss: float | None = None   # sent by Next; None when no stop is set
 
 
 class RiskRequest(BaseModel):
@@ -221,9 +223,32 @@ def compute_risk(req: RiskRequest):
 # ========================= SCREENER (simple: drawdown + cash flow) =========================
 def get_universe():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-    table = pd.read_html(html)[0]
-    return table["Symbol"].str.replace(".", "-", regex=False).tolist()
+    html = requests.get(
+        url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30
+    ).text
+    # pandas 2.2+ needs a file-like object; a raw HTML string makes read_html
+    # try to open it as a path and dump the whole page into the error.
+    buf = io.StringIO(html)
+
+    table = None
+    # 1) preferred: the constituents table by id
+    try:
+        buf.seek(0)
+        table = pd.read_html(buf, attrs={"id": "constituents"})[0]
+    except Exception:
+        table = None
+    # 2) fallback: whichever parsed table actually has a "Symbol" column
+    if table is None or "Symbol" not in table.columns:
+        buf.seek(0)
+        for cand in pd.read_html(buf):
+            if "Symbol" in cand.columns:
+                table = cand
+                break
+
+    if table is None or "Symbol" not in table.columns:
+        raise RuntimeError("S&P 500 table not found on Wikipedia page")
+
+    return table["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
 
 
 def run_screen(tickers, p):
