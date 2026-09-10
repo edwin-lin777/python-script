@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import io
 import time
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ class Position(BaseModel):
     ticker: str
     shares: float
     cost_basis: float | None = None
+    stop_loss: float | None = None   # sent by Next; None when no stop is set
 
 
 class RiskRequest(BaseModel):
@@ -32,6 +34,11 @@ class ScreenRequest(BaseModel):
     fcf_yield_min: float = 3.0        # generous bar so quality-growth (VEEV-type) passes (%)
     use_all_time_high: bool = True    # False -> use 52-week high
     max_tickers: int | None = None    # cap the universe for quick testing
+    # "quiet base" gate: little price movement over the last ~month (consolidation)
+    require_quiet: bool = False       # off by default; turn on to hunt non-movers
+    quiet_lookback_days: int = 21     # ~1 trading month
+    max_range_pct: float = 12.0       # last-month high-to-low range must be <= this (%)
+    max_drift_pct: float = 6.0        # net change over the window must be within +/- this (%)
 
 
 @app.get("/health")
@@ -49,6 +56,41 @@ def _num(v):
     if np.isnan(f) or np.isinf(f):
         return None
     return f
+
+
+def fetch_fundamentals(tickers):
+    """Per-ticker valuation stats from yfinance .info.
+    Missing values stay None so Claude can say 'unavailable' instead of
+    guessing a multiple from memory (the whole reason this exists)."""
+    out = {}
+    for t in tickers:
+        rec = {
+            "fwd_pe": None, "pe": None, "peg": None, "ps": None,
+            "fcf_yield_%": None, "sector": None, "pct_from_52w_high_%": None,
+        }
+        try:
+            info = yf.Ticker(t).info
+            rec["fwd_pe"] = _num(info.get("forwardPE"))
+            rec["pe"]     = _num(info.get("trailingPE"))
+            rec["peg"]    = _num(info.get("trailingPegRatio"))
+            rec["ps"]     = _num(info.get("priceToSalesTrailing12Months"))
+            rec["sector"] = info.get("sector")
+
+            fcf  = info.get("freeCashflow")
+            mcap = info.get("marketCap")
+            if fcf is not None and mcap:
+                rec["fcf_yield_%"] = _num(fcf / mcap * 100)
+
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            hi = info.get("fiftyTwoWeekHigh")
+            if price and hi:
+                rec["pct_from_52w_high_%"] = _num((price / hi - 1) * 100)
+        except Exception:
+            pass
+        finally:
+            time.sleep(0.1)   # be gentle with Yahoo, same as the screener
+        out[t] = rec
+    return out
 
 
 # ========================= RISK (unchanged) =========================
@@ -161,11 +203,18 @@ def compute_risk(req: RiskRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
+    # Live valuation stats so the downstream Claude review doesn't guess multiples.
+    try:
+        fundamentals = fetch_fundamentals(tickers)
+    except Exception:
+        fundamentals = {}
+
     positions_out = []
     for ticker, row in per_pos.iterrows():
         rec = {"ticker": ticker}
         for col, val in row.items():
             rec[col] = _num(val)
+        rec.update(fundamentals.get(ticker, {}))
         positions_out.append(rec)
 
     portfolio_out = {k: _num(v) for k, v in portfolio.items()}
@@ -177,9 +226,32 @@ def compute_risk(req: RiskRequest):
 
 def get_universe():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-    table = pd.read_html(html)[0]
-    return table["Symbol"].str.replace(".", "-", regex=False).tolist()
+    html = requests.get(
+        url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30
+    ).text
+    # pandas 2.2+ needs a file-like object; a raw HTML string makes read_html
+    # try to open it as a path and dump the whole page into the error.
+    buf = io.StringIO(html)
+
+    table = None
+    # 1) preferred: the constituents table by id
+    try:
+        buf.seek(0)
+        table = pd.read_html(buf, attrs={"id": "constituents"})[0]
+    except Exception:
+        table = None
+    # 2) fallback: whichever parsed table actually has a "Symbol" column
+    if table is None or "Symbol" not in table.columns:
+        buf.seek(0)
+        for cand in pd.read_html(buf):
+            if "Symbol" in cand.columns:
+                table = cand
+                break
+
+    if table is None or "Symbol" not in table.columns:
+        raise RuntimeError("S&P 500 table not found on Wikipedia page")
+
+    return table["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
 
 
 def run_screen(tickers, p):
@@ -217,10 +289,44 @@ def run_screen(tickers, p):
             if drawdown > p.drawdown_min:
                 continue
 
+            # gate 3 (optional): "quiet base" — little movement over ~1 month.
+            # range_pct = last-month high-to-low spread; drift_pct = net change.
+            # A true consolidation is BOTH a tight range AND a flat drift.
+            range_pct = None
+            drift_pct = None
+            try:
+                if p.use_all_time_high:
+                    recent = hist.dropna()                       # reuse the series we already have
+                else:
+                    recent = tk.history(period="3mo")["Close"].dropna()
+                window = recent.tail(p.quiet_lookback_days)
+                if len(window) >= 5:
+                    w_hi = float(window.max())
+                    w_lo = float(window.min())
+                    w_mean = float(window.mean())
+                    w_first = float(window.iloc[0])
+                    w_last = float(window.iloc[-1])
+                    if w_mean > 0:
+                        range_pct = (w_hi - w_lo) / w_mean * 100
+                    if w_first > 0:
+                        drift_pct = (w_last / w_first - 1) * 100
+            except Exception:
+                pass
+
+            if p.require_quiet:
+                if range_pct is None or drift_pct is None:
+                    continue
+                if range_pct > p.max_range_pct:            # too wide a range -> still swinging
+                    continue
+                if abs(drift_pct) > p.max_drift_pct:       # trending, not flat
+                    continue
+
             records.append({
                 "ticker": t, "sector": info.get("sector"),
                 "price": price, "high": high,
                 "drawdown_%": drawdown, "fcf_yield_%": fcf_yield,
+                "range_1m_%": range_pct,                   # last-month high-to-low spread
+                "drift_1m_%": drift_pct,                   # last-month net change
                 "pe": info.get("trailingPE"),        # eyeball only
                 "fwd_pe": info.get("forwardPE"),     # eyeball only
             })
