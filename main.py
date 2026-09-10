@@ -171,7 +171,10 @@ def compute_risk(req: RiskRequest):
     portfolio_out = {k: _num(v) for k, v in portfolio.items()}
     return {"positions": positions_out, "portfolio": portfolio_out}
 
+
 # ========================= SCREENER (simple: drawdown + cash flow) =========================
+
+
 def get_universe():
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
