@@ -13,7 +13,13 @@ import json
 import os
 import sys
 
-from screener import ScreenRequest, clean_records, drawdown_sort_key, get_universe, run_screen
+from screener import (
+    ScreenRequest,
+    accumulation_sort_key,
+    clean_records,
+    get_universe,
+    run_screen,
+)
 
 TABLE = "screener_results"
 
@@ -36,7 +42,54 @@ def parse_args():
         "--min-score", type=float, default=50.0,
         help="accumulation score threshold, 0-100 (default 50)",
     )
+    ap.add_argument(
+        "--max-base-decline", type=float, default=None,
+        help="override max_base_decline_pct_per_mo (default 4.0); "
+             "the usual reason a screen comes back thin",
+    )
+    ap.add_argument(
+        "--no-require-decline", action="store_true",
+        help="drop the mandatory 'base must follow a selloff' condition",
+    )
+    ap.add_argument(
+        "--fwd-pe-max", type=float, default=None,
+        help="override fwd_pe_max (default 20.0); 0 disables the valuation gate",
+    )
     return ap.parse_args()
+
+
+def funnel_summary(stats):
+    """Where every ticker died, in gate order.
+
+    The point is tuning: when the screen comes back thin, this says which knob
+    is responsible instead of leaving you to guess.
+    """
+    order = [
+        ("no_fundamentals", "missing fcf/mcap/price"),
+        ("fail_fcf_yield", "FCF yield below min"),
+        ("fwd_pe_missing_or_negative", "fwd P/E missing or negative"),
+        ("fail_fwd_pe", "fwd P/E above max"),
+        ("no_history", "no usable price history"),
+        ("no_52w_high", "no 52w high"),
+        ("fail_drawdown", "drawdown not deep enough"),
+        ("quiet_unmeasurable", "quiet gate unmeasurable"),
+        ("fail_quiet_range", "quiet gate: range too wide"),
+        ("fail_quiet_drift", "quiet gate: drifting"),
+        ("base_too_short", "base shorter than base_min_days"),
+        ("insufficient_history", "not enough bars for base metrics"),
+        ("still_declining", "base still declining (max_base_decline_pct_per_mo)"),
+        ("no_preceding_decline", "no real selloff before the base"),
+        ("score_below_min", "score below min_accumulation_score"),
+        ("ticker_error", "yahoo/parse error"),
+    ]
+    total = stats.get("universe", 0)
+    lines = ["", f"[scan_job] funnel ({total} tickers):"]
+    for key, label in order:
+        n = stats.get(key, 0)
+        if n:
+            lines.append(f"[scan_job]   -{n:<4} {label}")
+    lines.append(f"[scan_job]   ={stats.get('passed', 0):<4} PASSED")
+    return "\n".join(lines)
 
 
 def score_summary(results):
@@ -80,11 +133,19 @@ def main(args):
         fcf_yield_min=3.0,
         require_quiet=False,
         max_tickers=args.max_tickers,   # echoed into params so the row is honest
-        # The full thesis: cheap on forward earnings, beaten down, and showing a
-        # base that formed after the decline. --require-accumulation only forces
-        # it on; the nightly run has it on regardless.
-        require_accumulation=True,
+        # RANKED, not gated: keep every cheap beaten-down name and sort by how
+        # much it looks like a post-selloff base. Gating on accumulation cut the
+        # list to ~2 names, which discovers less than a ranked list where the
+        # diagnostic columns let you judge borderline names yourself.
+        # --require-accumulation turns it back into a hard filter.
+        require_accumulation=args.require_accumulation,
         min_accumulation_score=args.min_score,
+        require_preceding_decline=not args.no_require_decline,
+        **({} if args.max_base_decline is None
+           else {"max_base_decline_pct_per_mo": args.max_base_decline}),
+        # --fwd-pe-max 0 turns the valuation gate off entirely
+        **({} if args.fwd_pe_max is None
+           else {"fwd_pe_max": args.fwd_pe_max or None}),
     )
 
     tickers = get_universe()
@@ -92,8 +153,9 @@ def main(args):
         tickers = tickers[: args.max_tickers]
     print(f"[scan_job] universe: {len(tickers)} tickers", flush=True)
 
-    records = run_screen(tickers, params)          # full universe unless --max-tickers
-    records.sort(key=drawdown_sort_key)            # most beaten-down first
+    stats = {}
+    records = run_screen(tickers, params, stats)   # full universe unless --max-tickers
+    records.sort(key=accumulation_sort_key)        # best-looking base first
     results = clean_records(records)               # NaN/inf -> None so jsonb is valid
 
     if args.dry_run:
@@ -102,6 +164,7 @@ def main(args):
             f"{len(json.dumps(results))} bytes - nothing written",
             flush=True,
         )
+        print(funnel_summary(stats), flush=True)
         print(score_summary(results), flush=True)
         # Best-scoring names first, so the dry run shows what the gate WOULD keep.
         top = sorted(results, key=lambda r: r.get("accumulation_score") or -1, reverse=True)

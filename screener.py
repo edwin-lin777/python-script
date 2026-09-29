@@ -97,6 +97,20 @@ def drawdown_sort_key(r):
     return float("inf") if dd is None else dd
 
 
+def accumulation_sort_key(r):
+    """Sort ascending = best base first, unscored records last.
+
+    Ranking rather than gating: every value name stays in the list, and the
+    ones that look most like a post-selloff base float to the top where the
+    diagnostic columns let you judge them yourself. Score is negated so a plain
+    ascending sort puts the highest first, matching how drawdown_sort_key reads.
+    Ties break on drawdown, so equally-based names show most beaten-down first.
+    """
+    score = r.get("accumulation_score")
+    dd = drawdown_sort_key(r)
+    return (float("inf"), dd) if score is None else (-float(score), dd)
+
+
 def clean_records(records):
     """JSON-safe copy of the screen output (NaN/inf -> None).
 
@@ -369,31 +383,54 @@ def score_accumulation(m, p):
     return score
 
 
-def passes_accumulation(m, p):
-    """Mandatory conditions for the accumulation gate.
+def accumulation_reject_reason(m, p):
+    """None if the accumulation gate passes, else a short reason string.
 
-    Only three things are non-negotiable (plus the score): enough history to
-    compute meaningfully, a base of at least base_min_days, and no strong
-    ongoing downtrend. Everything else is expressed through the score.
+    Split out from passes_accumulation so the funnel report can say WHICH
+    condition rejected each name -- that's what tells you which knob to turn
+    when the screen comes back too thin.
     """
     if m["base_days"] is None or m["base_days"] < p.base_min_days:
-        return False
+        return "base_too_short"
     # Unmeasurable -> skip, rather than passing a name on unreliable numbers.
     if m["accumulation_score"] is None or m["base_slope_%_per_mo"] is None:
-        return False
+        return "insufficient_history"
     if m["base_slope_%_per_mo"] < -p.max_base_decline_pct_per_mo:
-        return False
+        return "still_declining"
     # The base has to be stabilisation *after* a decline, not a quiet stretch
     # following a rally. Without this the drawdown gate alone lets through names
     # that are merely far below an old high.
     if p.require_preceding_decline:
         sell = m["selloff_return_%"]
         if sell is None or sell > -p.min_selloff_decline_pct:
-            return False
-    return m["accumulation_score"] >= p.min_accumulation_score
+            return "no_preceding_decline"
+    if m["accumulation_score"] < p.min_accumulation_score:
+        return "score_below_min"
+    return None
 
 
-def run_screen(tickers, p):
+def passes_accumulation(m, p):
+    """Mandatory conditions for the accumulation gate.
+
+    Only three things are non-negotiable (plus the score and, by default, a
+    real preceding decline): enough history to compute meaningfully, a base of
+    at least base_min_days, and no strong ongoing downtrend.
+    """
+    return accumulation_reject_reason(m, p) is None
+
+
+def run_screen(tickers, p, stats=None):
+    """Screen the universe. Pass a dict as `stats` to collect funnel counts.
+
+    stats is optional and purely diagnostic, so existing callers (main.py's
+    /screen route) are unaffected.
+    """
+    counts = stats if stats is not None else {}
+
+    def drop(reason):
+        counts[reason] = counts.get(reason, 0) + 1
+
+    counts["universe"] = len(tickers)
     records = []
     for t in tickers:
         try:
@@ -404,20 +441,22 @@ def run_screen(tickers, p):
             mcap  = info.get("marketCap")
             price = info.get("currentPrice") or info.get("regularMarketPrice")
             if fcf is None or mcap is None or price is None or mcap <= 0:
-                continue
+                drop("no_fundamentals"); continue
 
             # gate 1: decent cash flow (generous so premium names pass)
             fcf_yield = fcf / mcap * 100
             if fcf_yield < p.fcf_yield_min:
-                continue
+                drop("fail_fcf_yield"); continue
 
             # gate 1b: valuation. Cheap on forward earnings, not just beaten
             # down. Checked here because info is already in hand -- it rejects
             # before the history fetch, so it costs no extra Yahoo request.
             fwd_pe = info.get("forwardPE")
             if p.fwd_pe_max is not None:
-                if fwd_pe is None or fwd_pe <= 0 or fwd_pe > p.fwd_pe_max:
-                    continue
+                if fwd_pe is None or fwd_pe <= 0:
+                    drop("fwd_pe_missing_or_negative"); continue
+                if fwd_pe > p.fwd_pe_max:
+                    drop("fail_fwd_pe"); continue
 
             # One OHLCV fetch per ticker, reused by every stage below. The ATH
             # path needs the full series; otherwise 2y comfortably covers the
@@ -427,10 +466,10 @@ def run_screen(tickers, p):
             period = "max" if p.use_all_time_high else "2y"
             df = tk.history(period=period, auto_adjust=True)
             if df is None or df.empty or "Close" not in df:
-                continue
+                drop("no_history"); continue
             df = df.dropna(subset=["Close"])
             if df.empty:
-                continue
+                drop("no_history"); continue
             hist = df["Close"]
 
             # gate 2: big drawdown from the high
@@ -440,12 +479,12 @@ def run_screen(tickers, p):
             else:
                 high = info.get("fiftyTwoWeekHigh")
                 if high is None or high <= 0:
-                    continue
+                    drop("no_52w_high"); continue
                 ref_price = float(price)
 
             drawdown = (ref_price / high - 1) * 100
             if drawdown > p.drawdown_min:
-                continue
+                drop("fail_drawdown"); continue
 
             # gate 3 (optional): "quiet base" — little movement over ~1 month.
             # range_pct = last-month high-to-low spread; drift_pct = net change.
@@ -467,17 +506,19 @@ def run_screen(tickers, p):
 
             if p.require_quiet:
                 if range_pct is None or drift_pct is None:
-                    continue
+                    drop("quiet_unmeasurable"); continue
                 if range_pct > p.max_range_pct:            # too wide a range -> still swinging
-                    continue
+                    drop("fail_quiet_range"); continue
                 if abs(drift_pct) > p.max_drift_pct:       # trending, not flat
-                    continue
+                    drop("fail_quiet_drift"); continue
 
             # gate 4 (optional): accumulation base. Diagnostics are computed for
             # every survivor either way, so a disabled gate still tells you why.
             base = compute_base_metrics(df, p)
-            if p.require_accumulation and not passes_accumulation(base, p):
-                continue
+            if p.require_accumulation:
+                reason = accumulation_reject_reason(base, p)
+                if reason:
+                    drop(reason); continue
 
             rec = {
                 "ticker": t, "sector": info.get("sector"),
@@ -491,7 +532,9 @@ def run_screen(tickers, p):
             rec.update(base)                         # base/accumulation diagnostics
             records.append(rec)
         except Exception:
+            drop("ticker_error")
             continue
         finally:
             time.sleep(0.1)      # runs on EVERY path (continue/skip/error) -> no Yahoo hammering
+    counts["passed"] = len(records)
     return records

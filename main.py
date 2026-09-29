@@ -7,7 +7,14 @@ import yfinance as yf
 
 # Screening lives in screener.py so the nightly cron (scan_job.py) can import it
 # without pulling in FastAPI. _num is shared: the risk endpoint below uses it too.
-from screener import ScreenRequest, _num, clean_records, drawdown_sort_key, get_universe, run_screen
+from screener import (
+    ScreenRequest,
+    _num,
+    accumulation_sort_key,
+    clean_records,
+    get_universe,
+    run_screen,
+)
 
 app = FastAPI()
 
@@ -212,7 +219,7 @@ def screen(req: ScreenRequest):
         tickers = tickers[: req.max_tickers]
 
     records = run_screen(tickers, req)
-    records.sort(key=drawdown_sort_key)   # most beaten-down first (ordering, not ranking)
+    records.sort(key=accumulation_sort_key)   # best-looking base first (ordering, not a signal)
 
     clean = clean_records(records)
     return {
