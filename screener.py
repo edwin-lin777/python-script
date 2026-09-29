@@ -35,6 +35,11 @@ class ScreenRequest(BaseModel):
     # simple two-gate screen: big drawdown + decent cash flow
     drawdown_min: float = -30.0       # keep if price is >= this far below the high (%)
     fcf_yield_min: float = 3.0        # generous bar so quality-growth (VEEV-type) passes (%)
+    # Valuation gate. None turns it off entirely (the old behaviour, where pe /
+    # fwd_pe were carried for display only). When set, a name must have a
+    # POSITIVE forward P/E at or below this: unknown or negative forward
+    # earnings can't be called cheap, so those are dropped rather than assumed.
+    fwd_pe_max: float | None = 20.0
     use_all_time_high: bool = True    # False -> use 52-week high
     max_tickers: int | None = None    # cap the universe for quick testing
     # "quiet base" gate: little price movement over the last ~month (consolidation)
@@ -49,6 +54,10 @@ class ScreenRequest(BaseModel):
     # require_accumulation is on.
     require_accumulation: bool = False
     min_accumulation_score: float = 50.0   # out of 100; deliberately loose
+    # MANDATORY by default: the base only counts if it followed a real decline.
+    # Scored alone this was too weak -- names consolidating after a *rally* were
+    # clearing 70/100 purely because they sit far below a years-old high.
+    require_preceding_decline: bool = True
 
     base_window_days: int = 20        # the consolidation window we measure (~1 month)
     base_min_days: int = 10           # MANDATORY floor: ~2 weeks of base, not a 3-day pause
@@ -58,7 +67,7 @@ class ScreenRequest(BaseModel):
     # Scoring thresholds. Loose on purpose: better to hand back a longer list to
     # chart-check by eye than to silently filter out every real setup.
     max_base_range_pct: float = 20.0          # base high-to-low spread (%)
-    max_base_decline_pct_per_mo: float = 7.0  # MANDATORY: steeper decline = still bleeding
+    max_base_decline_pct_per_mo: float = 4.0  # MANDATORY: steeper decline = still bleeding
     max_vol_compression: float = 1.10         # base vol / selloff vol; < 1 means calming
     max_support_spread_pct: float = 8.0       # how tightly the lowest lows cluster (%)
     max_low_undercut_pct: float = 4.0         # how far late-base lows may undercut early ones
@@ -374,6 +383,13 @@ def passes_accumulation(m, p):
         return False
     if m["base_slope_%_per_mo"] < -p.max_base_decline_pct_per_mo:
         return False
+    # The base has to be stabilisation *after* a decline, not a quiet stretch
+    # following a rally. Without this the drawdown gate alone lets through names
+    # that are merely far below an old high.
+    if p.require_preceding_decline:
+        sell = m["selloff_return_%"]
+        if sell is None or sell > -p.min_selloff_decline_pct:
+            return False
     return m["accumulation_score"] >= p.min_accumulation_score
 
 
@@ -394,6 +410,14 @@ def run_screen(tickers, p):
             fcf_yield = fcf / mcap * 100
             if fcf_yield < p.fcf_yield_min:
                 continue
+
+            # gate 1b: valuation. Cheap on forward earnings, not just beaten
+            # down. Checked here because info is already in hand -- it rejects
+            # before the history fetch, so it costs no extra Yahoo request.
+            fwd_pe = info.get("forwardPE")
+            if p.fwd_pe_max is not None:
+                if fwd_pe is None or fwd_pe <= 0 or fwd_pe > p.fwd_pe_max:
+                    continue
 
             # One OHLCV fetch per ticker, reused by every stage below. The ATH
             # path needs the full series; otherwise 2y comfortably covers the
@@ -462,7 +486,7 @@ def run_screen(tickers, p):
                 "range_1m_%": range_pct,                   # last-month high-to-low spread
                 "drift_1m_%": drift_pct,                   # last-month net change
                 "pe": info.get("trailingPE"),        # eyeball only
-                "fwd_pe": info.get("forwardPE"),     # eyeball only
+                "fwd_pe": fwd_pe,                    # gated when fwd_pe_max is set
             }
             rec.update(base)                         # base/accumulation diagnostics
             records.append(rec)
